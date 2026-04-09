@@ -71,6 +71,27 @@ POROSITY_TABLE = {1: 0.403, 2: 0.439, 3: 0.430, 4: 0.520,
                   5: 0.614, 6: 0.766, 7: 0.472}
 POROSITY_DEFAULT = 0.4
 
+# HRRR soil layer depths (mid-layer, metres).
+# HRRR (RUC LSM) native 9-level depths differ from Noah LSM 4-level depths.
+# When HRRR GRIB2 is filtered to the 4 standard depthBelowLandLayer records
+# that WRF typically outputs, the layer boundaries are 0–0.1, 0.1–0.4,
+# 0.4–1.0, 1.0–2.0 m, giving these mid-points:
+ZSOIL_HRRR = np.array([0.05, 0.25, 0.70, 1.50], dtype=np.float32)
+
+# Candidate variable names for HRRR soil fields (checked in order).
+# cfgrib typically exposes 'st' / 'soilw'; NCL-decoded GRIB may use longer names.
+_HRRR_TSOIL_CANDIDATES = ['st', 'ST', 'tsoil', 'TSOIL', 'soilt', 'SOILT', 't']
+_HRRR_SOILW_CANDIDATES = ['soilw', 'SOILW', 'sm', 'SM', 'vsw', 'VSW', 'SOIL_M']
+
+# Known HRRR 4-layer boundary pairs (top_m, bot_m) used to derive mid-layer
+# depths.  Order is shallowest → deepest.
+_HRRR_KNOWN_LAYER_BOUNDS = [
+    (0.0, 0.1),
+    (0.1, 0.4),
+    (0.4, 1.0),
+    (1.0, 2.0),
+]
+
 
 # =============================================================================
 # SECTION 3: Mode Definitions
@@ -83,6 +104,7 @@ class Mode(Enum):
     ERA5_DELTA = "era5_delta"
     ERA5_WETNESS = "era5_wetness"
     GFS = "gfs"
+    HRRR = "hrrr"
     CESM_CC = "cesm_cc"
 
 # Legacy mode mapping for backward compatibility.
@@ -107,7 +129,7 @@ def normalize_mode(mode_str: str) -> Mode:
     if mode_lower == 'auto':
         raise ValueError(
             "Mode 'auto' is no longer supported. "
-            "Please choose one of: era5, era5_lsm, era5_delta, era5_wetness, gfs, cesm_cc."
+            "Please choose one of: era5, era5_lsm, era5_delta, era5_wetness, gfs, hrrr, cesm_cc."
         )
 
     for m in Mode:
@@ -260,6 +282,18 @@ def validate_mode_dependencies(mode: Mode, deps: Dict[str, DependencyStatus]) ->
         print(f"  Install with pip:   {deps['cfgrib'].pip_install}")
         print(f"  Install with conda: {deps['cfgrib'].conda_install}")
         print()
+
+    if mode == Mode.HRRR and not deps['cfgrib'].available:
+        d = deps['cfgrib']
+        print("\n" + "=" * 60)
+        print("ERROR: cfgrib is required for HRRR mode")
+        print("=" * 60)
+        print("  HRRR GRIB2 files use projected grids and non-standard variable")
+        print("  naming that cfgrib handles reliably.  Without cfgrib, HRRR")
+        print("  decoding will almost certainly fail.")
+        print(f"  Install with pip:   {d.pip_install}")
+        print(f"  Install with conda: {d.conda_install}")
+        sys.exit(1)
 
 
 
@@ -502,17 +536,20 @@ CONFIG = RuntimeConfig()
 xr = None
 RegularGridInterpolator = None
 laplace = None
+griddata = None  # scipy.interpolate.griddata — needed for projected-grid regridding
 
 def do_delayed_imports():
     """Import heavier dependencies after validation."""
-    global xr, RegularGridInterpolator, laplace
+    global xr, RegularGridInterpolator, laplace, griddata
     import xarray
     xr = xarray
     try:
         from scipy.interpolate import RegularGridInterpolator as RGI
+        from scipy.interpolate import griddata as _griddata
         from scipy.ndimage import laplace as lap
         RegularGridInterpolator = RGI
         laplace = lap
+        griddata = _griddata
     except ImportError:
         pass
 
@@ -1084,6 +1121,512 @@ def write_outputs(outdir: str, outdir_nc: str, netcdf_out: bool,
 
 
 # =============================================================================
+# SECTION 16A: HRRR Data Structures
+# =============================================================================
+
+@dataclass
+class HRRRSoilData:
+    """Container for loaded and inspected HRRR soil fields."""
+    soilt_raw: np.ndarray          # (nsoil, y, x)
+    soilw_raw: np.ndarray          # (nsoil, y, x)
+    src_lat: np.ndarray            # 1-D (regular_ll) or 2-D (projected)
+    src_lon: np.ndarray            # 1-D (regular_ll) or 2-D (projected)
+    latlon_is_2d: bool             # True when lat/lon are 2-D arrays
+    grid_kind: str                 # "regular_ll" or "projected"
+    zsoil_native: np.ndarray       # mid-layer depths in metres (nsoil,)
+    time_info: Optional[str]       # human-readable time label or None
+    var_names: Dict[str, str]      # {'tsoil': actual_name, 'soilw': actual_name}
+
+
+# =============================================================================
+# SECTION 16B: HRRR Depth Metadata Extraction
+# =============================================================================
+
+def _extract_hrrr_depth_metadata(ds) -> np.ndarray:
+    """
+    Derive mid-layer soil depths (metres) from an opened HRRR dataset.
+
+    Strategy (tried in order):
+    1. Look for coordinate variables that encode layer boundaries
+       (e.g. 'topLevel'/'bottomLevel', or 'depthBelowLandLayer' with bounds).
+    2. If the dataset exposes explicit depth values as a coordinate, use them
+       directly as mid-layer depths.
+    3. If the number of layers is 4 and matches the known HRRR 4-layer
+       boundaries, return ZSOIL_HRRR.
+    4. Otherwise raise an error.
+    """
+    nlayers = None
+    # Determine how many soil layers are present from the first soil variable.
+    for vn in list(ds.data_vars):
+        shape = ds[vn].shape
+        if len(shape) >= 2:
+            # The shallowest dimension that is exactly 4 (or small) is likely
+            # the soil-layer axis.  cfgrib puts it first when time is absent.
+            nlayers = shape[0] if shape[0] <= 12 else None
+            break
+
+    # --- Strategy 1: explicit top/bottom coordinate pairs ---
+    top_names = ['topLevel', 'top', 'depthBelowLandLayer_top']
+    bot_names = ['bottomLevel', 'bottom', 'depthBelowLandLayer_bottom']
+    top_coord = bot_coord = None
+    for tn in top_names:
+        if tn in ds.coords:
+            top_coord = ds[tn].values
+            break
+    for bn in bot_names:
+        if bn in ds.coords:
+            bot_coord = ds[bn].values
+            break
+
+    if top_coord is not None and bot_coord is not None:
+        mids = (np.asarray(top_coord, dtype=np.float64) +
+                np.asarray(bot_coord, dtype=np.float64)) / 2.0
+        if np.all(mids > 0):
+            print(f"  [HRRR depth] from top/bottom bounds: {mids}")
+            return mids.astype(np.float32)
+
+    # --- Strategy 2: single depth coordinate ---
+    depth_names = ['depthBelowLandLayer', 'depth', 'soilLayer', 'level']
+    for dn in depth_names:
+        if dn in ds.coords:
+            vals = np.asarray(ds[dn].values, dtype=np.float64)
+            if vals.ndim == 1 and vals.size >= 2 and np.all(vals > 0):
+                print(f"  [HRRR depth] from coordinate '{dn}': {vals}")
+                return vals.astype(np.float32)
+
+    # --- Strategy 3: match known layer count ---
+    if nlayers == NSOIL:
+        print(f"  [HRRR depth] no explicit depth metadata; "
+              f"{NSOIL} layers matches default ZSOIL_HRRR")
+        return ZSOIL_HRRR.copy()
+
+    raise ValueError(
+        f"Cannot determine HRRR soil layer depths.\n"
+        f"  Detected {nlayers} layers but found no depth coordinate.\n"
+        f"  Please verify the GRIB2 file contains standard HRRR soil fields."
+    )
+
+
+# =============================================================================
+# SECTION 16C: HRRR Grid Classification
+# =============================================================================
+
+def _classify_hrrr_grid(lat: np.ndarray, lon: np.ndarray) -> Tuple[bool, str]:
+    """
+    Classify whether HRRR lat/lon arrays represent a regular lat-lon grid
+    or a projected (curvilinear / 2-D) grid.
+
+    Returns:
+        (latlon_is_2d, grid_kind)
+        latlon_is_2d: True if arrays are 2-D
+        grid_kind:    "regular_ll" or "projected"
+    """
+    if lat.ndim == 1 and lon.ndim == 1:
+        # 1-D arrays — check monotonicity to confirm regularity.
+        lat_mono = np.all(np.diff(lat) > 0) or np.all(np.diff(lat) < 0)
+        lon_mono = np.all(np.diff(lon) > 0) or np.all(np.diff(lon) < 0)
+        if lat_mono and lon_mono:
+            return False, "regular_ll"
+        # 1-D but not monotonic is unusual — treat as projected to be safe.
+        print("  [HRRR grid] WARNING: 1-D lat/lon but non-monotonic; "
+              "treating as projected")
+        return False, "projected"
+
+    if lat.ndim == 2 and lon.ndim == 2:
+        # 2-D arrays — could still be a rectilinear grid stored as 2-D
+        # meshgrids.  Check whether each row of lon is constant and each
+        # column of lat is constant (within tolerance).
+        if lat.shape == lon.shape and lat.shape[0] > 1 and lat.shape[1] > 1:
+            lat_col_spread = np.max(np.ptp(lat, axis=1))   # variation along x
+            lon_row_spread = np.max(np.ptp(lon, axis=0))   # variation along y
+            tol = 1e-4  # ~11 m at equator
+            if lat_col_spread < tol and lon_row_spread < tol:
+                print("  [HRRR grid] 2-D arrays are rectilinear → regular_ll")
+                return True, "regular_ll"
+        return True, "projected"
+
+    raise ValueError(
+        f"Unexpected lat/lon dimensionality: lat.ndim={lat.ndim}, "
+        f"lon.ndim={lon.ndim}"
+    )
+
+
+# =============================================================================
+# SECTION 16D: HRRR Loader
+# =============================================================================
+
+def _find_var_in_dataset(ds, candidates: List[str], label: str) -> str:
+    """Find the first matching variable name from a list of candidates."""
+    for c in candidates:
+        if c in ds.data_vars:
+            return c
+    avail = list(ds.data_vars)
+    raise KeyError(
+        f"[HRRR] No {label} variable found.\n"
+        f"  Tried: {candidates}\n"
+        f"  Available: {avail}"
+    )
+
+
+def _load_hrrr_soil_fields(hrrr_file: str, date_int: Optional[int]) -> HRRRSoilData:
+    """
+    Load and inspect HRRR GRIB2 soil fields.
+
+    Two-stage design:
+      Stage 1 — Load: open with cfgrib, discover variables, extract arrays.
+      Stage 2 — Inspect: classify grid geometry, extract depth metadata.
+    """
+    print(f"  Loading HRRR from: {hrrr_file}")
+
+    # ------------------------------------------------------------------
+    # Stage 1: Load with cfgrib
+    # ------------------------------------------------------------------
+    # cfgrib filter: soil temperature lives under depthBelowLandLayer.
+    # We open two datasets — one for temperature, one for moisture —
+    # because cfgrib may split them into separate hypercubes.
+
+    tsoil_ds = None
+    soilw_ds = None
+
+    # Try opening with shortName filters first (most reliable for HRRR).
+    for sn_temp in ['st', 'soilt', 'tsoil', 't']:
+        try:
+            tsoil_ds = xr.open_dataset(
+                hrrr_file, engine='cfgrib',
+                backend_kwargs={'filter_by_keys': {
+                    'typeOfLevel': 'depthBelowLandLayer',
+                    'shortName': sn_temp,
+                }},
+            )
+            print(f"  [HRRR] Soil temperature dataset opened (shortName='{sn_temp}')")
+            break
+        except Exception:
+            continue
+
+    for sn_mois in ['soilw', 'sm', 'vsw']:
+        try:
+            soilw_ds = xr.open_dataset(
+                hrrr_file, engine='cfgrib',
+                backend_kwargs={'filter_by_keys': {
+                    'typeOfLevel': 'depthBelowLandLayer',
+                    'shortName': sn_mois,
+                }},
+            )
+            print(f"  [HRRR] Soil moisture dataset opened (shortName='{sn_mois}')")
+            break
+        except Exception:
+            continue
+
+    # Fallback: open without shortName filter and find variables manually.
+    if tsoil_ds is None or soilw_ds is None:
+        print("  [HRRR] shortName filters failed; opening with typeOfLevel only")
+        try:
+            ds_all = xr.open_dataset(
+                hrrr_file, engine='cfgrib',
+                backend_kwargs={'filter_by_keys': {
+                    'typeOfLevel': 'depthBelowLandLayer',
+                }},
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[HRRR] Cannot open {hrrr_file} with cfgrib.\n"
+                f"  Ensure the file is a valid GRIB2 with depthBelowLandLayer "
+                f"soil fields.\n  cfgrib error: {e}"
+            )
+        if tsoil_ds is None:
+            tsoil_ds = ds_all
+        if soilw_ds is None:
+            soilw_ds = ds_all
+
+    # --- Discover variable names ---
+    tsoil_vn = _find_var_in_dataset(tsoil_ds, _HRRR_TSOIL_CANDIDATES,
+                                    "soil temperature")
+    soilw_vn = _find_var_in_dataset(soilw_ds, _HRRR_SOILW_CANDIDATES,
+                                    "soil moisture")
+    print(f"  [HRRR] Variables: tsoil='{tsoil_vn}', soilw='{soilw_vn}'")
+
+    # --- Extract raw arrays ---
+    tsoil_raw = tsoil_ds[tsoil_vn].values.copy()
+    soilw_raw = soilw_ds[soilw_vn].values.copy()
+
+    # --- Handle time dimension if present ---
+    time_info = None
+    if 'time' in tsoil_ds.coords:
+        tvals = tsoil_ds['time'].values
+        if tvals.ndim == 0:
+            time_info = str(tvals)
+            print(f"  [HRRR] Single time step: {time_info}")
+        elif date_int is not None:
+            idx = find_time_index(tsoil_ds, date_int)
+            tsoil_raw = tsoil_ds[tsoil_vn].isel(time=idx).values.copy()
+            soilw_raw = soilw_ds[soilw_vn].isel(time=idx).values.copy()
+            time_info = str(tvals[idx])
+        else:
+            # No date requested, take first time step.
+            tsoil_raw = tsoil_ds[tsoil_vn].isel(time=0).values.copy()
+            soilw_raw = soilw_ds[soilw_vn].isel(time=0).values.copy()
+            time_info = str(tvals[0])
+            print(f"  [HRRR] No --date; using first time step: {time_info}")
+    elif 'valid_time' in tsoil_ds.coords:
+        time_info = str(tsoil_ds['valid_time'].values)
+        print(f"  [HRRR] valid_time: {time_info}")
+
+    # --- Extract coordinates ---
+    lat_cand = ['latitude', 'lat', 'XLAT', 'gridlat_0']
+    lon_cand = ['longitude', 'lon', 'XLONG', 'gridlon_0']
+    lat_name = resolve_coord(tsoil_ds, lat_cand, "latitude")
+    lon_name = resolve_coord(tsoil_ds, lon_cand, "longitude")
+    src_lat = tsoil_ds[lat_name].values.copy()
+    src_lon = tsoil_ds[lon_name].values.copy()
+
+    # --- Extract depth metadata ---
+    zsoil = _extract_hrrr_depth_metadata(tsoil_ds)
+
+    # Close datasets.
+    tsoil_ds.close()
+    if soilw_ds is not tsoil_ds:
+        soilw_ds.close()
+
+    # ------------------------------------------------------------------
+    # Stage 2: Inspect structure
+    # ------------------------------------------------------------------
+
+    # Ensure arrays are at least 2-D spatial (nsoil, y, x) or (y, x).
+    # cfgrib may return (nsoil, y, x) or (y, x) depending on layer count.
+    if tsoil_raw.ndim == 2:
+        tsoil_raw = tsoil_raw[np.newaxis, ...]
+    if soilw_raw.ndim == 2:
+        soilw_raw = soilw_raw[np.newaxis, ...]
+
+    nsoil_t = tsoil_raw.shape[0]
+    nsoil_w = soilw_raw.shape[0]
+
+    if nsoil_t != NSOIL:
+        raise ValueError(
+            f"[HRRR] Expected {NSOIL} soil temperature layers, got {nsoil_t}.\n"
+            f"  Shape: {tsoil_raw.shape}\n"
+            f"  If HRRR uses a different layer count, the mapping logic must "
+            f"be extended."
+        )
+    if nsoil_w != NSOIL:
+        raise ValueError(
+            f"[HRRR] Expected {NSOIL} soil moisture layers, got {nsoil_w}.\n"
+            f"  Shape: {soilw_raw.shape}"
+        )
+
+    # Classify grid geometry.
+    latlon_is_2d, grid_kind = _classify_hrrr_grid(src_lat, src_lon)
+    print(f"  [HRRR] Grid: {grid_kind} "
+          f"(lat {'2D' if latlon_is_2d else '1D'} {src_lat.shape}, "
+          f"lon {'2D' if latlon_is_2d else '1D'} {src_lon.shape})")
+    print(f"  [HRRR] Soil layers (zsoil): {zsoil}")
+    print(f"  [HRRR] tsoil: {tsoil_raw.shape} "
+          f"min={np.nanmin(tsoil_raw):.2f} max={np.nanmax(tsoil_raw):.2f}")
+    print(f"  [HRRR] soilw: {soilw_raw.shape} "
+          f"min={np.nanmin(soilw_raw):.4f} max={np.nanmax(soilw_raw):.4f}")
+
+    return HRRRSoilData(
+        soilt_raw=tsoil_raw,
+        soilw_raw=soilw_raw,
+        src_lat=src_lat,
+        src_lon=src_lon,
+        latlon_is_2d=latlon_is_2d,
+        grid_kind=grid_kind,
+        zsoil_native=zsoil,
+        time_info=time_info,
+        var_names={'tsoil': tsoil_vn, 'soilw': soilw_vn},
+    )
+
+
+# =============================================================================
+# SECTION 16E: Projected-Grid Regridding
+# =============================================================================
+
+def regrid_projected_to_target(
+    data_2d: np.ndarray,
+    src_lat_2d: np.ndarray,
+    src_lon_2d: np.ndarray,
+    dst_lat: np.ndarray,
+    dst_lon: np.ndarray,
+    method: str = 'linear',
+) -> np.ndarray:
+    """
+    Regrid a field on a projected (2-D lat/lon) grid to a regular target grid.
+
+    Uses scipy.interpolate.griddata for unstructured → structured interpolation.
+    Falls back to nearest-neighbor if linear interpolation leaves NaN gaps
+    (common at domain edges where the projected grid doesn't fully cover the
+    target).
+
+    Args:
+        data_2d:     (ny_src, nx_src) source field
+        src_lat_2d:  (ny_src, nx_src) latitude of each source cell
+        src_lon_2d:  (ny_src, nx_src) longitude of each source cell
+        dst_lat:     1-D target latitudes
+        dst_lon:     1-D target longitudes
+        method:      'linear' (default) or 'nearest'
+
+    Returns:
+        (nlat_dst, nlon_dst) interpolated field
+    """
+    if griddata is None:
+        raise ImportError(
+            "[HRRR] scipy.interpolate.griddata is required for projected-grid "
+            "regridding but scipy is not available.\n"
+            "  Install with: pip install scipy\n"
+            "  Or:           conda install -c conda-forge scipy"
+        )
+
+    # Flatten source coordinates and data.
+    src_pts = np.column_stack([src_lat_2d.ravel(), src_lon_2d.ravel()])
+    src_vals = data_2d.ravel()
+
+    # Remove NaN source points (griddata cannot handle them).
+    valid = np.isfinite(src_vals)
+    if valid.sum() == 0:
+        warnings.warn("[HRRR regrid] All source values are NaN")
+        return np.full((len(dst_lat), len(dst_lon)), np.nan, dtype=np.float32)
+
+    src_pts = src_pts[valid]
+    src_vals = src_vals[valid]
+
+    # Build target meshgrid.
+    dst_lat_g, dst_lon_g = np.meshgrid(dst_lat, dst_lon, indexing='ij')
+    dst_pts = np.column_stack([dst_lat_g.ravel(), dst_lon_g.ravel()])
+
+    # Primary interpolation.
+    result = griddata(src_pts, src_vals, dst_pts, method=method)
+    result = result.reshape(dst_lat_g.shape)
+
+    # Fill remaining NaNs with nearest-neighbor (edge gaps).
+    nan_mask = np.isnan(result)
+    n_nan = int(nan_mask.sum())
+    if n_nan > 0 and method != 'nearest':
+        nn = griddata(src_pts, src_vals, dst_pts, method='nearest')
+        nn = nn.reshape(dst_lat_g.shape)
+        result[nan_mask] = nn[nan_mask]
+        print(f"  [HRRR regrid] {n_nan} edge NaNs filled by nearest-neighbor")
+
+    return result.astype(np.float32)
+
+
+# =============================================================================
+# SECTION 16F: HRRR run_hrrr() — Mode Implementation
+# =============================================================================
+
+def run_hrrr(grid: str, date_int: Optional[int], hrrr_file: str,
+             indir: str, outdir: str, outdir_nc: str, netcdf_out: bool):
+    """
+    Mode: hrrr — initialize soil from an HRRR GRIB2 file.
+
+    Two processing paths based on the detected grid geometry:
+      regular_ll  → reuse existing pipeline (process_soil_layer, etc.)
+      projected   → use regrid_projected_to_target (scipy griddata)
+    """
+    dst_lat, dst_lon, landmask, nlat, nlon = prepare_common_params(grid, indir)
+    print(f"  [HRRR mode]")
+
+    # --- Load and inspect ---
+    hdata = _load_hrrr_soil_fields(hrrr_file, date_int)
+    zsoil = hdata.zsoil_native
+
+    soilt = np.zeros((NSOIL, nlat, nlon), dtype=np.float32)
+    soilw = np.zeros((NSOIL, nlat, nlon), dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # CASE A: regular lat-lon grid → reuse existing pipeline
+    # ------------------------------------------------------------------
+    if hdata.grid_kind == "regular_ll":
+        print("  [HRRR] Processing as regular lat-lon grid")
+
+        # If 2-D but rectilinear, extract 1-D vectors.
+        if hdata.latlon_is_2d:
+            src_lat_1d = hdata.src_lat[:, 0]
+            src_lon_1d = hdata.src_lon[0, :]
+        else:
+            src_lat_1d = hdata.src_lat
+            src_lon_1d = hdata.src_lon
+
+        for n in range(NSOIL):
+            has_nan = bool(np.isnan(hdata.soilt_raw[n]).any())
+            soilt[n] = process_soil_layer(
+                hdata.soilt_raw[n], src_lat_1d, src_lon_1d,
+                dst_lat, dst_lon,
+                do_poisson=has_nan,
+                label=f"HRRR_T[{n}]",
+                cyclic_lon=False,  # HRRR is regional, never cyclic
+            )
+
+        for n in range(NSOIL):
+            has_nan = bool(np.isnan(hdata.soilw_raw[n]).any())
+            soilw[n] = process_soil_layer(
+                hdata.soilw_raw[n], src_lat_1d, src_lon_1d,
+                dst_lat, dst_lon,
+                landmask=landmask, is_moisture=True,
+                do_poisson=has_nan,
+                label=f"HRRR_W[{n}]",
+                cyclic_lon=False,
+            )
+
+    # ------------------------------------------------------------------
+    # CASE B: projected grid → scipy griddata regridding
+    # ------------------------------------------------------------------
+    elif hdata.grid_kind == "projected":
+        print("  [HRRR] Processing as projected grid (scipy griddata)")
+
+        if griddata is None:
+            raise RuntimeError(
+                "[HRRR] Projected-grid regridding requires scipy, which is "
+                "not available.\n"
+                "  Install with: pip install scipy\n"
+                "  Or:           conda install -c conda-forge scipy"
+            )
+
+        for n in range(NSOIL):
+            soilt[n] = regrid_projected_to_target(
+                hdata.soilt_raw[n],
+                hdata.src_lat, hdata.src_lon,
+                dst_lat, dst_lon,
+            )
+            print(f"  HRRR_T[{n}]: {soilt[n].min():.2f}..{soilt[n].max():.2f}")
+
+        for n in range(NSOIL):
+            raw_w = regrid_projected_to_target(
+                hdata.soilw_raw[n],
+                hdata.src_lat, hdata.src_lon,
+                dst_lat, dst_lon,
+            )
+            soilw[n] = apply_land_mask(raw_w, landmask)
+            print(f"  HRRR_W[{n}]: {soilw[n].min():.4f}..{soilw[n].max():.4f}")
+
+    else:
+        raise ValueError(f"[HRRR] Unknown grid_kind: {hdata.grid_kind}")
+
+    # --- Sanity checks ---
+    tmin, tmax = float(soilt.min()), float(soilt.max())
+    wmin, wmax = float(soilw.min()), float(soilw.max())
+    print(f"  Final: soilt {tmin:.2f}..{tmax:.2f}  soilw {wmin:.4f}..{wmax:.4f}")
+
+    if tmax < 100 or tmax > 400:
+        warnings.warn(
+            f"[HRRR] Soil temperature range [{tmin:.1f}, {tmax:.1f}] K "
+            f"looks suspicious — verify units are Kelvin."
+        )
+    if wmax > 1.0:
+        warnings.warn(
+            f"[HRRR] Soil moisture max={wmax:.4f} exceeds 1.0 m³/m³ — "
+            f"verify units."
+        )
+
+    # --- Output ---
+    date_tag = str(date_int) if date_int else "nodate"
+    write_outputs(outdir, outdir_nc, netcdf_out,
+                  f"soil_init_{date_tag}_{grid}_HRRR",
+                  NSOIL, nlon, nlat, zsoil, soilt, soilw, dst_lat, dst_lon)
+    return soilt, soilw
+
+
+# =============================================================================
 # SECTION 17: Mode Implementations
 # =============================================================================
 
@@ -1638,6 +2181,17 @@ def resolve_mode_paths(mode: Mode, args: argparse.Namespace, on_derecho: bool) -
             check_file=True,
         )
     
+    # --- HRRR mode ---
+    if mode == Mode.HRRR:
+        paths['filedata'] = resolve_input_path(
+            user_value=getattr(args, 'filedata', ''),
+            default_path=None,
+            label='HRRR GRIB2 file (--filedata)',
+            on_derecho=on_derecho,
+            required=True,
+            check_file=True,
+        )
+
     # --- CESM CC mode ---
     if mode == Mode.CESM_CC:
         paths['base_bin'] = resolve_input_path(
@@ -1754,6 +2308,17 @@ def dispatch_mode(mode: Mode, args: argparse.Namespace, resolved: ResolvedModePa
             netcdf_out=netcdf_out,
         )
     
+    elif mode == Mode.HRRR:
+        return run_hrrr(
+            grid=args.grid,
+            date_int=args.date,
+            hrrr_file=resolved.get('filedata'),
+            indir=args.indir,
+            outdir=args.outdir,
+            outdir_nc=args.outdir_nc,
+            netcdf_out=netcdf_out,
+        )
+
     elif mode == Mode.CESM_CC:
         return run_cesm_cc(
             grid=args.grid,
@@ -1788,6 +2353,7 @@ Modes:
   era5_delta     ERA5 + climate delta (PGW)
   era5_wetness   ERA5 → soil wetness (gSAM format)
   gfs            GFS GRIB2 data
+  hrrr           HRRR GRIB2 data (projected or regular grid)
   cesm_cc        CESM climate change overlay
 
 Public interface notes:
@@ -1806,6 +2372,11 @@ For ERA5 modes, you can provide data in two ways:
   --filedata  : Single ERA5 file (e.g., ERA5_soil_Sep2017.nc)
   If both are provided, --filedata takes priority over --filepath.
 
+For HRRR mode:
+  --filedata  : HRRR GRIB2 file (required, no default path)
+  The grid geometry (regular lat-lon vs projected) is detected automatically.
+  Projected grids (e.g., Lambert Conformal) require scipy for regridding.
+
 On Derecho:
   --filepath and --era5_lsm_path can be omitted (defaults used)
   --porosity_file still requires an explicit path unless you add a reliable default.
@@ -1816,6 +2387,8 @@ Examples:
       --filepath /path/to/era5/data
   python make_2D_init_soil.py --mode era5 --grid 3840x1920_dyvar --date 2017090500 \
       --filedata ./ERA5/ERA5_SOIL_SNOW_Sep5_2017.nc
+  python make_2D_init_soil.py --mode hrrr --grid 3456x3456_LI --date 2025090309 \
+      --filedata ./hrrr.t09z.wrfsubhf00.grib2
 """
     )
 
@@ -1826,12 +2399,12 @@ Examples:
                    help='Target grid name (e.g., 3456x3456_LI)')
 
     p.add_argument('--date', type=int, default=None,
-                   help='Date as YYYYMMDDHH (not required for cesm_cc)')
+                   help='Date as YYYYMMDDHH (not required for cesm_cc; optional for hrrr single-time files)')
 
     p.add_argument('--filepath', default='',
                    help='ERA5 data directory (NCAR RDA style)')
     p.add_argument('--filedata', default='',
-                   help='Single data file (ERA5 or GFS)')
+                   help='Single data file (ERA5, GFS, or HRRR GRIB2)')
     p.add_argument('--era5_lsm_path', default='',
                    help='ERA5 land-sea mask file')
     p.add_argument('--porosity_file', default='',
@@ -1923,7 +2496,7 @@ def main():
     mode = normalize_mode(args.mode)
     validate_mode_dependencies(mode, deps)
 
-    if mode != Mode.CESM_CC and args.date is None:
+    if mode not in (Mode.CESM_CC, Mode.HRRR) and args.date is None:
         raise ValueError(f"--date is required for mode '{mode.value}'")
 
     print(f"  Mode: {mode.value}")
