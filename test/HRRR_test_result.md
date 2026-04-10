@@ -4,23 +4,23 @@ Date: 2026-04-09
 
 ## Summary
 
-Tested `hrrr` mode in `/glade/u/home/songchenl/tools/make_2D_init_soil.py` using the conda environment:
+Tested the updated `hrrr` mode in `/glade/u/home/songchenl/tools/make_2D_init_soil.py` using:
 
 ```text
 /glade/derecho/scratch/songchenl/condaEnvs/default/bin/python
 ```
 
-The test failed before producing output files. The immediate failure is that the sample HRRR GRIB2 file does not expose the layered soil fields the script expects.
+The new HRRR loader behaves better than the previous version. It no longer fails immediately on an empty filtered dataset. Instead, it falls back to a broader scan and exits with a clear diagnostic when the HRRR file does not contain layered soil fields.
 
 ## Command Used
 
 ```bash
-/glade/derecho/scratch/songchenl/condaEnvs/default/bin/python \
+/glade/derecho/scratch/songchenl/condaEnvs/default/bin/python -u \
   /glade/u/home/songchenl/tools/make_2D_init_soil.py \
   --mode hrrr \
   --grid hrrr_test \
   --date 2020081001 \
-  --filedata /glade/u/home/songchenl/PythonScripts/derecho/data/HRRR/T00/hrrr_2020081001_01.grib2 \
+  --filedata /glade/u/home/songchenl/tools/hrrr_test_run/hrrr_2020081001_01.grib2 \
   --indir /glade/u/home/songchenl/tools/hrrr_test_run/NC_D \
   --outdir /glade/u/home/songchenl/tools/hrrr_test_run/BIN_D \
   --outdir_nc /glade/u/home/songchenl/tools/hrrr_test_run/NC_D \
@@ -30,42 +30,56 @@ The test failed before producing output files. The immediate failure is that the
 ## Test Inputs
 
 - Script: `/glade/u/home/songchenl/tools/make_2D_init_soil.py`
-- HRRR sample file: `/glade/u/home/songchenl/PythonScripts/derecho/data/HRRR/T00/hrrr_2020081001_01.grib2`
-- Temporary landmask file created for the test:
+- Source HRRR file directory: `/glade/u/home/songchenl/PythonScripts/derecho/data/HRRR/T00`
+- Test GRIB2 file used for the clean rerun:
+  `/glade/u/home/songchenl/tools/hrrr_test_run/hrrr_2020081001_01.grib2`
+- Temporary landmask file:
   `/glade/u/home/songchenl/tools/hrrr_test_run/NC_D/landmask_hrrr_test.nc`
 
 ## Result
 
-The script reached HRRR mode, loaded the target grid, and then failed in the HRRR loader. Reported error:
+The script started normally, entered HRRR mode, attempted targeted filters, then fell back to scanning all GRIB datasets. It failed with the following runtime error:
 
 ```text
-KeyError: "[HRRR] No soil temperature variable found.
-  Tried: ['st', 'ST', 'tsoil', 'TSOIL', 'soilt', 'SOILT', 't']
-  Available: []"
+[HRRR] Cannot find layered soil temperature or soil moisture fields in:
+  /glade/u/home/songchenl/tools/hrrr_test_run/hrrr_2020081001_01.grib2
+
+File diagnostic:
+  Total datasets in file: 40
+  Soil-related datasets found (but missing required layered fields):
+    dataset 6: vars=['mstav'], level=['depthBelowLand']
 ```
 
-This comes from the variable discovery step in the HRRR loader after `cfgrib` opens an empty dataset.
+## Interpretation
 
-Relevant code paths:
+The new HRRR mode correctly identifies that this file is not a valid layered-soil HRRR product for soil initialization.
 
-- `/glade/u/home/songchenl/tools/make_2D_init_soil.py:1517`
-- `/glade/u/home/songchenl/tools/make_2D_init_soil.py:1530`
-- `/glade/u/home/songchenl/tools/make_2D_init_soil.py:1291`
-- `/glade/u/home/songchenl/tools/make_2D_init_soil.py:1342`
+Observed behavior:
 
-## Additional Verification
+- Targeted search for layered HRRR soil variables failed
+- Broad cfgrib scan found only `mstav`
+- The file does not contain the expected 4-layer soil fields such as:
+  - `st`
+  - `soilw`
+  - `typeOfLevel='depthBelowLandLayer'`
 
-Checked GRIB metadata in the `T00` directory with `grib_ls`.
+This means the `T00` sample file tested here is still not suitable for the success path of HRRR soil initialization.
 
-Observed pattern:
+## Relevant Code Paths
 
-- Files contain `mstav` at `depthBelowLand`
-- Files do not show the expected 4-layer `depthBelowLandLayer` soil fields
-- The script currently expects layered HRRR soil variables such as `st` and `soilw`
+- `/glade/u/home/songchenl/tools/make_2D_init_soil.py:1337`
+- `/glade/u/home/songchenl/tools/make_2D_init_soil.py:1426`
+- `/glade/u/home/songchenl/tools/make_2D_init_soil.py:1465`
+- `/glade/u/home/songchenl/tools/make_2D_init_soil.py:1662`
 
-This indicates the failure is caused by the sample HRRR data content, not by the Python environment.
+## Output Files
 
-## Notes
+No soil initialization output was produced.
 
-- No binary output was written to `/glade/u/home/songchenl/tools/hrrr_test_run/BIN_D`
-- One script usability issue remains: it prints that a soil dataset was "opened" even when the resulting dataset is empty
+Verified:
+
+- `/glade/u/home/songchenl/tools/hrrr_test_run/BIN_D` is empty
+
+## Conclusion
+
+The updated HRRR mode now fails for the right reason and with a useful diagnostic. The remaining blocker is the input data product, not the Python environment and not the earlier empty-dataset bug.
